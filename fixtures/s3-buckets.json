@@ -1,0 +1,60 @@
+{
+  "account_id": "192000000001",
+  "region": "us-east-1",
+  "buckets": [
+    {
+      "name": "acme-prod-assets",
+      "region": "us-east-1",
+      "acl_grants": [
+        {"grantee": "http://acs.amazonaws.com/groups/global/AllUsers", "permission": "READ"},
+        {"grantee": "http://acs.amazonaws.com/groups/global/AuthenticatedUsers", "permission": "WRITE"}
+      ],
+      "policy_statements": [
+        {
+          "effect": "Allow",
+          "principal": "*",
+          "action": ["s3:GetObject", "s3:ListBucket"],
+          "resource": "arn:aws:s3:::acme-prod-assets/*"
+        }
+      ],
+      "versioning": "Enabled",
+      "logging": {"enabled": true, "target_bucket": "acme-audit-logs"},
+      "encryption": {"rule": {"sse_algorithm": "AES256"}},
+      "public_access_block": {
+        "block_public_acls": true,
+        "ignore_public_acls": true,
+        "block_public_policy": false,
+        "restrict_public_buckets": false
+      }
+    },
+    {
+      "name": "acme-backups",
+      "region": "us-west-2",
+      "acl_grants": [],
+      "policy_statements": [
+        {
+          "effect": "Allow",
+          "principal": {"AWS": "arn:aws:iam::192000000002:root"},
+          "action": "s3:GetObject",
+          "resource": "arn:aws:s3:::acme-backups/*"
+        }
+      ],
+      "versioning": "Suspended",
+      "logging": {"enabled": false},
+      "encryption": {},
+      "public_access_block": null
+    },
+    {
+      "name": "acme-marketing-static",
+      "region": "us-east-1",
+      "acl_grants": [
+        {"grantee": "http://acs.amazonaws.com/groups/global/AllUsers", "permission": "FULL_CONTROL"}
+      ],
+      "policy_statements": [],
+      "versioning": "Disabled",
+      "logging": {"enabled": false},
+      "encryption": {},
+      "public_access_block": {}
+    }
+  ]
+}

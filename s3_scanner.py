@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import hmac
 import json
+import os
 import sys
 import urllib.error
 import urllib.parse
@@ -359,6 +360,205 @@ class BucketWordlist:
         return list(cls.COMMON_NAMES)
 
 
+# ---------------------------------------------------------------------------
+# Offline fixture auditor
+#
+# Reads realistic JSON bucket-configuration fixtures (ACL grants, bucket
+# policies, configuration settings) and runs the same class of detection rules
+# the live scanner uses, producing findings with severity + remediation.
+# Fully offline — no AWS access required.
+# ---------------------------------------------------------------------------
+
+PUBLIC_GRANTEE_URIS = (
+    "http://acs.amazonaws.com/groups/global/AllUsers",
+    "http://acs.amazonaws.com/groups/global/AuthenticatedUsers",
+)
+
+PERMISSION_SEVERITY = {
+    "READ": "MEDIUM",
+    "WRITE": "CRITICAL",
+    "READ_ACP": "LOW",
+    "WRITE_ACP": "HIGH",
+    "FULL_CONTROL": "CRITICAL",
+}
+
+OFFLINE_REMEDIATIONS = {
+    "public_grant": "Remove the {grantee} grant from the bucket ACL; use bucket policies with explicit principals instead.",
+    "public_policy": "Restrict the bucket policy Principal to specific accounts/ARNs and add an S3 public access block.",
+    "versioning_disabled": "Enable bucket versioning to preserve object history for recovery and forensics.",
+    "logging_disabled": "Enable S3 server access logging to an audit bucket for the retention period you require.",
+    "encryption_disabled": "Enable default server-side encryption (SSE-S3 or SSE-KMS) at the bucket level.",
+    "public_access_block_missing": "Enable BlockPublicAcls, IgnorePublicAcls, BlockPublicPolicy and RestrictPublicBuckets.",
+    "plaintext_report": "Rotate embedded credentials and load them from a secrets manager at runtime.",
+}
+
+
+def _normalise_acl_grants(raw):
+    """Accept ACL grants as lists of {'grantee': URI, 'permission': NAME}."""
+    grants = []
+    for g in raw or []:
+        if not isinstance(g, dict):
+            continue
+        grantee = g.get("grantee", "")
+        uri = g.get("uri", "")
+        if grantee in ("AllUsers", "AuthenticatedUsers") and not uri:
+            uri = ("http://acs.amazonaws.com/groups/global/AllUsers"
+                   if grantee == "AllUsers" else
+                   "http://acs.amazonaws.com/groups/global/AuthenticatedUsers")
+        permission = g.get("permission", "").upper()
+        grants.append({"grantee": grantee or uri, "permission": permission, "uri": uri})
+    return grants
+
+
+class S3OfflineAuditor:
+    """Detect S3 misconfigurations from realistic bucket-state fixtures."""
+
+    def audit(self, buckets):
+        """buckets: list of bucket config dicts -> list of finding dicts."""
+        findings = []
+        for bucket in buckets:
+            name = bucket.get("name", "unknown-bucket")
+            findings.extend(self._audit_acl(name, bucket.get("acl_grants")))
+            findings.extend(self._audit_policy(name, bucket.get("policy_statements")))
+            findings.extend(self._audit_config(name, bucket))
+        return findings
+
+    def _audit_acl(self, name, acl_grants):
+        findings = []
+        for grant in _normalise_acl_grants(acl_grants):
+            grantee = grant["grantee"]
+            permission = grant["permission"]
+            public = any(u in grantee or grantee in ("AllUsers", "AuthenticatedUsers")
+                         for u in ("AllUsers", "AuthenticatedUsers"))
+            if not public:
+                continue
+            severity = PERMISSION_SEVERITY.get(permission, "HIGH")
+            findings.append({
+                "severity": severity,
+                "category": "bucket_acl",
+                "rule_id": "CL1-ACL-001",
+                "bucket": name,
+                "resource": f"s3://{name}",
+                "message": f"Bucket ACL grants {permission} to public grantee '{grantee}'.",
+                "remediation": OFFLINE_REMEDIATIONS["public_grant"].format(grantee=grantee),
+            })
+        return findings
+
+    def _audit_policy(self, name, statements):
+        findings = []
+        for stmt in statements or []:
+            if not isinstance(stmt, dict):
+                continue
+            effect = stmt.get("effect", "Allow")
+            principal = stmt.get("principal", "")
+            actions = stmt.get("action", [])
+            if isinstance(actions, str):
+                actions = [actions]
+            public = principal == "*" or (isinstance(principal, dict) and "*" in principal.get("AWS", []))
+            if effect == "Allow" and public:
+                findings.append({
+                    "severity": "CRITICAL",
+                    "category": "bucket_policy",
+                    "rule_id": "CL1-POL-001",
+                    "bucket": name,
+                    "resource": f"s3://{name}",
+                    "message": f"Bucket policy allows {', '.join(actions) if actions else 'actions'} to Principal '*'.",
+                    "remediation": OFFLINE_REMEDIATIONS["public_policy"],
+                })
+        return findings
+
+    def _audit_config(self, name, bucket):
+        findings = []
+        versioning = bucket.get("versioning", "")
+        if str(versioning).lower() in ("disabled", "suspended", "", "none"):
+            findings.append({
+                "severity": "MEDIUM",
+                "category": "versioning",
+                "rule_id": "CL1-CFG-001",
+                "bucket": name,
+                "resource": f"s3://{name}",
+                "message": "Bucket versioning is disabled or suspended.",
+                "remediation": OFFLINE_REMEDIATIONS["versioning_disabled"],
+            })
+
+        if not bucket.get("logging", {}).get("enabled", False):
+            findings.append({
+                "severity": "MEDIUM",
+                "category": "logging",
+                "rule_id": "CL1-CFG-002",
+                "bucket": name,
+                "resource": f"s3://{name}",
+                "message": "Server access logging is not enabled.",
+                "remediation": OFFLINE_REMEDIATIONS["logging_disabled"],
+            })
+
+        encryption = bucket.get("encryption", {}) or {}
+        if not encryption.get("rule"):
+            findings.append({
+                "severity": "HIGH",
+                "category": "encryption",
+                "rule_id": "CL1-CFG-003",
+                "bucket": name,
+                "resource": f"s3://{name}",
+                "message": "Default encryption is not configured.",
+                "remediation": OFFLINE_REMEDIATIONS["encryption_disabled"],
+            })
+
+        block = bucket.get("public_access_block", {}) or {}
+        configured = [block.get(k, False) for k in
+                      ("block_public_acls", "ignore_public_acls",
+                       "block_public_policy", "restrict_public_buckets")]
+        if not all(configured):
+            findings.append({
+                "severity": "HIGH",
+                "category": "public_access_block",
+                "rule_id": "CL1-CFG-004",
+                "bucket": name,
+                "resource": f"s3://{name}",
+                "message": "Public access block is not fully enabled.",
+                "remediation": OFFLINE_REMEDIATIONS["public_access_block_missing"],
+            })
+        return findings
+
+
+def load_bucket_fixtures(path):
+    """Load fixture file of bucket configs. Accepts a bare list or an object
+    with a 'buckets' key."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except OSError as exc:
+        raise FileNotFoundError(f"Fixtures file not found: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON in fixtures file {path}: {exc}") from exc
+    if isinstance(data, dict):
+        return data.get("buckets", [])
+    if isinstance(data, list):
+        return data
+    raise ValueError(f"Unsupported fixture structure in {path}")
+
+
+def print_offline_report(buckets, findings):
+    print("\n" + "=" * 64)
+    print("  CL1 — AWS S3 Offline Misconfiguration Audit")
+    print("=" * 64)
+    print(f"  Buckets audited: {len(buckets)}")
+    print(f"  Findings:        {len(findings)}")
+    print("=" * 64)
+    counts = {}
+    for f in findings:
+        counts[f["severity"]] = counts.get(f["severity"], 0) + 1
+    for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
+        if sev in counts:
+            print(f"    {sev:9s}: {counts[sev]}")
+    print()
+    for f in findings:
+        print(f"  [{f['severity']:8s}] {f['rule_id']} {f['bucket']}")
+        print(f"      {f['message']}")
+        print(f"      Fix: {f['remediation']}")
+    print("\n" + "=" * 64 + "\n")
+
+
 def print_banner():
     banner = r"""
     ╔═══════════════════════════════════════════╗
@@ -372,16 +572,54 @@ def print_banner():
 def main():
     print_banner()
     parser = argparse.ArgumentParser(description="AWS S3 Bucket Scanner")
-    parser.add_argument("--access-key", default="", help="AWS Access Key ID")
+    parser.add_argument("--access-key", default="", help="AWS Access Key ID (your own credentials at runtime only)")
     parser.add_argument("--secret-key", default="", help="AWS Secret Access Key")
     parser.add_argument("--region", default="us-east-1", help="AWS region")
-    parser.add_argument("--bucket", default="", help="Specific bucket to scan")
+    parser.add_argument("--bucket", default="", help="Specific bucket to scan (live, must be authorized)")
     parser.add_argument("--enum", action="store_true", help="Enumerate buckets from wordlist")
     parser.add_argument("--list-objects", action="store_true", help="List bucket contents")
     parser.add_argument("--prefix", default="", help="Prefix filter for listing")
     parser.add_argument("--wordlist", nargs="*", help="Extra bucket names to check")
-    parser.add_argument("--output", default="", help="JSON output file")
+    parser.add_argument("--demo", action="store_true",
+                        help="Run offline demo against bundled fixture (no network)")
+    parser.add_argument("--fixtures", default="",
+                        help="Path to bucket-config fixtures JSON (offline audit)")
+    parser.add_argument("--output", "-o", default="",
+                        help="JSON output file (default: reports/ when in offline mode)")
+    parser.add_argument("--exit-code-on-findings", action="store_true",
+                        help="Exit 2 when CRITICAL/HIGH findings exist (CI-friendly)")
     args = parser.parse_args()
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+
+    if args.demo or args.fixtures or not (args.bucket or args.enum or args.access_key):
+        # Offline fixture mode — read-only misconfiguration audit.
+        fixture = args.fixtures or os.path.join(base_dir, "fixtures", "s3-buckets.json")
+        if not os.path.isfile(fixture):
+            print(f"[!] Fixture not found: {fixture}. Run --demo from the repo root.", file=sys.stderr)
+            return 1
+        print(f"[*] Offline mode — auditing fixtures: {fixture}")
+        try:
+            buckets = load_bucket_fixtures(fixture)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        findings = S3OfflineAuditor().audit(buckets)
+        print_offline_report(buckets, findings)
+        report = {
+            "tool": "CL1-AWSS3OfflineAuditor",
+            "mode": "offline-fixture",
+            "finding_count": len(findings),
+            "summary": {},
+            "findings": findings,
+        }
+        for f in findings:
+            report["summary"][f["severity"]] = report["summary"].get(f["severity"], 0) + 1
+        output = args.output or os.path.join(base_dir, "reports", "cl1-report.json")
+        write_report(report, output)
+        if args.exit_code_on_findings and any(f["severity"] in ("CRITICAL", "HIGH") for f in findings):
+            return 2
+        return 0
 
     scanner = S3Scanner(args.access_key, args.secret_key, args.region)
     all_results = []
@@ -427,7 +665,17 @@ def main():
         print(f"\n[+] Results saved to {args.output}")
 
     print("\n[*] Scan complete.")
+    return 0
+
+
+def write_report(report, output_path):
+    """Write a JSON report, creating parent directories as needed."""
+    parent = os.path.dirname(os.path.abspath(output_path))
+    os.makedirs(parent, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as fh:
+        json.dump(report, fh, indent=2, sort_keys=True)
+    print(f"[+] JSON report written to {output_path}")
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

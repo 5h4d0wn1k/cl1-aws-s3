@@ -29,21 +29,49 @@ This project implements an S3 bucket security scanner that:
 ## Usage
 
 ```bash
-# Scan a specific bucket (unauthenticated)
+# Offline demo (no cloud, no credentials) — audit bundled fixtures
+python3 s3_scanner.py --demo
+
+# Audit a custom bucket-config fixtures file (offline)
+python3 s3_scanner.py --fixtures fixtures/s3-buckets.json
+
+# Offline audit with JSON report + CI exit code
+python3 s3_scanner.py --demo --output reports/cl1-report.json --exit-code-on-findings
+
+# Live (authorized, your own account): scan a specific bucket (unauthenticated)
 python3 s3_scanner.py --bucket my-target-bucket
 
-# Authenticated scan (own buckets)
+# Authenticated scan (own buckets — credentials supplied at runtime only, never stored)
 python3 s3_scanner.py --access-key AKIA... --secret-key wJal...
 
 # Enumerate from wordlist
 python3 s3_scanner.py --enum --wordlist word1 word2 word3
-
-# List objects in a bucket
-python3 s3_scanner.py --bucket my-bucket --list-objects --prefix data/
-
-# Full scan with JSON output
-python3 s3_scanner.py --bucket my-bucket --output results.json
 ```
+
+## Exit Codes
+
+- `0` — completed cleanly (or demo finished without explicit CRITICAL/HIGH gate)
+- `1` — error (missing fixtures, unreadable file, bad JSON)
+- `2` — CRITICAL/HIGH findings present with `--exit-code-on-findings`
+
+## Live Lab Test Plan
+
+Runs entirely offline against `fixtures/s3-buckets.json` — no AWS account, no keys, no network.
+
+1. **Demo**: `python3 s3_scanner.py --demo` — expect CRITICAL/HIGH/MEDIUM findings for the public ACL grants, `Principal: "*"` policy on `acme-prod-assets`, missing versioning/logging/encryption, and missing public-access-blocks. Exit `0`.
+2. **JSON report**: `python3 s3_scanner.py --demo --output reports/cl1-report.json` — verify the report has `finding_count > 0`, a `summary` map, and per-finding `severity`, `rule_id`, `message`, `remediation`.
+3. **CI exit code**: `python3 s3_scanner.py --demo --exit-code-on-findings; echo $?` — expect `2`.
+4. **Unit tests**: `python3 -m unittest discover -s tests -v` — all pass (exercises XML parsers, SigV4 signing path, and the full fixture rule set).
+5. **Live (optional)**: pass your own `--access-key`/`--secret-key`/`--bucket` at runtime. Credentials are used only for that run and are never written to disk by this tool. Only test buckets you own or are authorized to probe.
+
+## Metrics
+
+- Detection rules exercised offline (all real code paths): public ACL grant (CL1-ACL-001), public bucket policy (CL1-POL-001), versioning disabled (CL1-CFG-001), logging disabled (CL1-CFG-002), encryption disabled (CL1-CFG-003), public access block missing (CL1-CFG-004)
+- Every finding carries `severity`, `category`, `rule_id`, `bucket`, `message`, and a `remediation` string
+- Offline fixture audit shares the ACL/policy semantics of the live scanner classes (`S3Scanner._parse_acl`, `_parse_list_objects`)
+- Live SigV4 signing path is exercised by unit tests for the derived signing key + payload hash
+- Exit-code contract: `0` clean / `1` error / `2` findings (with `--exit-code-on-findings`)
+- Zero third-party dependencies; `--demo` requires no network of any kind
 
 ## Example Output
 
@@ -62,7 +90,7 @@ python3 s3_scanner.py --bucket my-bucket --output results.json
 
 ## Legal Disclaimer
 
-**IMPORTANT: Read before use.**
+## IMPORTANT: Read before use.
 
 This project is provided for **educational and authorized security testing purposes only**.
 
